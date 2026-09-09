@@ -1,0 +1,524 @@
+name: Build Node.js (v24.x+) for ARMv6
+
+on:
+  workflow_dispatch:
+    inputs:
+      node_branch:
+        description: 'Node.js branch to build (e.g. v26.x, v24.x). Leave empty to use default (v26.x).'
+        required: false
+        default: ''
+
+env:
+  NODE_BRANCH: v26.x
+  NODE_DIR: ${{ github.workspace }}/node
+
+jobs:
+  # ============================================================
+  # JOB 1 - Setup, configure, build all host tools
+  # (mksnapshot, torque, bytecode_builtins_list_generator, etc.)
+  # ============================================================
+  build-host-tools:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    outputs:
+      node_version: ${{ steps.extract_version.outputs.node_version }}
+
+    steps:
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Install tttapa ARMv6 toolchain
+        run: |
+          wget https://github.com/tttapa/toolchains/releases/download/1.3.1/x-tools-armv6-rpi-linux-gnueabihf-gcc13.tar.xz
+          mkdir -p /opt/tttapa-toolchains
+          tar -xf x-tools-armv6-rpi-linux-gnueabihf-gcc13.tar.xz \
+            --strip-components=1 \
+            -C /opt/tttapa-toolchains \
+            x-tools/armv6-rpi-linux-gnueabihf
+          TOOLCHAIN_BIN=/opt/tttapa-toolchains/armv6-rpi-linux-gnueabihf/bin
+          "$TOOLCHAIN_BIN/armv6-rpi-linux-gnueabihf-g++" --version
+          echo "$TOOLCHAIN_BIN" >> $GITHUB_PATH
+          echo "TOOLCHAIN_BIN=$TOOLCHAIN_BIN" >> $GITHUB_ENV
+
+      - name: Install build dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            curl \
+            ccache \
+            gcc-multilib \
+            g++-multilib \
+            python3 \
+            pkg-config \
+            libc6-dev \
+            make \
+            git
+
+      - name: Resolve latest release tag
+        id: resolve
+        run: |
+          BRANCH="${{ github.event.inputs.node_branch }}"
+          BRANCH="${BRANCH:-${{ env.NODE_BRANCH }}}"
+          MAJOR=$(echo "$BRANCH" | grep -oE '^[0-9]+' || echo "$BRANCH" | sed 's/^v//;s/\.x$//')
+
+          # List remote tags matching this major version, sorted by version, take latest.
+          # Node tags releases as vX.Y.Z with no extra suffix on the main repo.
+          LATEST_TAG=$(git ls-remote --tags --refs https://github.com/nodejs/node.git \
+            | awk -F'/' '{print $NF}' \
+            | grep -E "^v${MAJOR}\.[0-9]+\.[0-9]+$" \
+            | sort -V \
+            | tail -1)
+
+          if [ -z "$LATEST_TAG" ]; then
+            echo "ERROR: could not resolve latest tag for branch $BRANCH"
+            exit 1
+          fi
+
+          echo "Resolved branch $BRANCH -> latest tag $LATEST_TAG"
+          echo "resolved_tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+          echo "resolved_branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Node.js source
+        id: cache-source
+        uses: actions/cache@v4
+        with:
+          path: node
+          key: node-source-${{ steps.resolve.outputs.resolved_tag }}-v1
+        # To invalidate cache: change key from v1 to v2 (or any new string)
+        # This ensures the next build starts fresh without cached source
+
+      - name: Configure cross-compilation environment
+        run: |
+          rustup target add i686-unknown-linux-gnu
+          rustup target add arm-unknown-linux-gnueabihf
+          
+          CROSS_GCC="$TOOLCHAIN_BIN/armv6-rpi-linux-gnueabihf-gcc -march=armv6zk"
+          CROSS_GXX="$TOOLCHAIN_BIN/armv6-rpi-linux-gnueabihf-g++ -march=armv6zk"
+
+          echo "CC=ccache ${CROSS_GCC}" >> $GITHUB_ENV
+          echo "CXX=ccache ${CROSS_GXX}" >> $GITHUB_ENV
+          echo "CC_host=ccache gcc -m32 -msse2" >> $GITHUB_ENV
+          echo "CXX_host=ccache g++ -m32 -msse2" >> $GITHUB_ENV
+          echo "CC_target=ccache ${CROSS_GCC}" >> $GITHUB_ENV
+          echo "CXX_target=ccache ${CROSS_GXX}" >> $GITHUB_ENV
+          echo "CARGO_TARGET_I686_UNKNOWN_LINUX_GNU_LINKER=gcc" >> $GITHUB_ENV
+          echo "CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_LINKER=${CROSS_GCC}" >> $GITHUB_ENV
+
+      - name: Clone Node.js at resolved tag
+        id: get_version
+        if: steps.cache-source.outputs.cache-hit != 'true'
+        run: |
+          git clone --branch "${{ steps.resolve.outputs.resolved_tag }}" --depth 1 --single-branch \
+            https://github.com/nodejs/node.git node
+          echo "Cloned $(cd node && git rev-parse HEAD)"
+
+      - name: Extract Node.js version
+        id: extract_version
+        run: |
+          NODE_VERSION="${{ steps.resolve.outputs.resolved_tag }}"
+          NODE_VERSION="${NODE_VERSION#v}"
+          echo "Detected Node.js version: $NODE_VERSION"
+          echo "NODE_VERSION=$NODE_VERSION" >> $GITHUB_ENV
+          echo "node_version=$NODE_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Patch string-hasher for 32-bit host build (v25.x+ only)
+        working-directory: ${{ env.NODE_DIR }}
+        run: |
+          FILE="deps/v8/src/strings/string-hasher.cc"
+
+          if ! grep -q "#ifdef __SSE2__" "$FILE"; then
+            echo "WARN: #ifdef __SSE2__ not found in $FILE — not patching"
+          else
+            # Replace all #ifdef __SSE2__ with the combined guard, but only on
+            # lines where the surrounding SSE2 block contains _mm_cvtsi128_si64.
+            # Strategy: do a global replace, then verify at least one block needed it.
+            # Since _mm_cvtsi128_si64 is x86_64-only, any file containing it with
+            # a plain #ifdef __SSE2__ needs the patch — safe to replace all occurrences.
+            if ! grep -q "_mm_cvtsi128_si64" "$FILE"; then
+              echo "ERROR: No _mm_cvtsi128_si64 found in $FILE — patch may not be needed"
+            else
+              COUNT=$(grep -c "#ifdef __SSE2__" "$FILE")
+              sed -i 's/#ifdef __SSE2__/#if defined(__SSE2__) \&\& defined(__x86_64__)/g' "$FILE"
+              echo "Patched $COUNT occurrence(s) in $FILE"
+            fi          
+          fi
+
+      - name: Patch V8 int64-lowering Tuple template disambiguation (v24.x only)
+        working-directory: ${{ env.NODE_DIR }}
+        run: |
+          FILE="deps/v8/src/compiler/turboshaft/int64-lowering-reducer.h"
+          if [ -f "$FILE" ] && grep -q "__ Tuple<" "$FILE"; then
+            sed -i 's/__ Tuple</__ template Tuple</g' "$FILE"
+            echo "Patched Tuple template disambiguation in $FILE"
+          else
+            echo "No unfixed '__ Tuple<' occurrences in $FILE, skipping (v25.x+ already upstream-fixed)"
+          fi
+
+      - name: ARMv6 patches - Patch configure.py - restore armv6
+        working-directory: ${{ env.NODE_DIR }}
+        run: |
+          # Insert the is_arch_armv6 function after the is_arch_armv7 return statement
+          sed -i -e "s/return cc_macros_cache.get('__ARM_ARCH') == '7'/&\n\ndef is_arch_armv6():\n  \"\"\"Check for ARMv6 instructions\"\"\"\n  cc_macros_cache = cc_macros()\n  return cc_macros_cache.get('__ARM_ARCH') == '6'/" \
+              -e "s/o\['variables'\]\['arm_version'\] = 'default'/o['variables']['arm_version'] = '6' if is_arch_armv6() else 'default'/" \
+              configure.py
+
+      - name: ARMv6 patches - Patch yield-processor.h in V8
+        working-directory: ${{ env.NODE_DIR }}
+        run: |
+          # Fixes deps/v8/src/base/platform/yield-processor.h: the `isb` instruction
+          # (used as a busy-wait hint) is only valid in ARM-mode assembly starting
+          # ARMv7 (or ARMv6T2). V8 incorrectly gates it on __ARM_ARCH >= 6, which
+          # breaks assembly on plain ARMv6/ARMv6K/ARMv6ZK targets. Falls back to a
+          # plain no-op on those, which is a safe (if slightly less efficient)
+          # substitute since YIELD_PROCESSOR is only a spin-wait hint, not a barrier.
+          sed -i 's/__ARM_ARCH >= 6/__ARM_ARCH >= 7/g' "deps/v8/src/base/platform/yield-processor.h"
+          echo "Patched yield-processor.h"
+
+      - name: ARMv6 patches - Patch json-stringifier.cc in V8
+        working-directory: ${{ env.NODE_DIR }}
+        run: |
+          FILE="deps/v8/src/json/json-stringifier.cc"
+          if [ ! -f "$FILE" ]; then
+            echo "ERROR: $FILE not found"
+          elif grep -q "HWY_TARGET != HWY_SCALAR" "$FILE"; then
+            echo "Already patched, skipping"
+          else
+            # Insert #if before the threshold definition and #endif before the SWAR return
+            sed -i -e "/constexpr int kUseSimdLengthThreshold = 32;/i #if HWY_TARGET != HWY_SCALAR" \
+            -e "/return AppendStringSWAR(chars, length, 0, 0, no_gc);/i #endif" "$FILE"
+  
+            echo "Patched json-stringifier.cc"
+          fi
+
+      - name: ARMv6 patches - Patch string-hasher.cc IsOnly8BitSIMD (v25.x+ only)
+        working-directory: ${{ env.NODE_DIR }}
+        run: |
+          #Skip broken SIMD path in string-hasher.cc on scalar-only Highway targets
+          FILE="deps/v8/src/strings/string-hasher.cc"
+  
+          if [ ! -f "$FILE" ] || grep -q "HWY_TARGET != HWY_SCALAR" "$FILE"; then
+            echo "File missing or already patched, skipping"
+          else
+            sed -i -e "/const uint16_t\* end = chars + len;/d" \
+              -e "s/bool IsOnly8BitSIMD(const uint16_t\* chars, unsigned len) {/&\n  const uint16_t* end = chars + len;\n#if HWY_TARGET != HWY_SCALAR/" \
+              -e "s|^\([[:space:]]*\)\/\/ Handle remaining characters\.|#endif\n\1// Handle remaining characters.|" \
+              "$FILE"
+            echo "Patched string-hasher.cc IsOnly8BitSIMD"
+          fi
+
+      - name: Configure Node.js
+        working-directory: ${{ env.NODE_DIR }}
+        run: |
+          ./configure --dest-cpu arm --partly-static
+
+      - name: Patch node_crates mk files (v26.x+ only)
+        working-directory: ${{ env.NODE_DIR }}
+        run: |
+          node_crates_host_file="${NODE_DIR}/out/deps/crates/node_crates.host.mk"
+          if [[ -f "$node_crates_host_file" ]]; then
+            sed -i 's|mkdir -p $(obj)/gen//release; \
+              cargo rustc --release --frozen --target-dir "$(obj)/gen"|mkdir -p $(obj)/gen/i686-unknown-linux-gnu/release; \
+              cargo rustc --release --frozen --target i686-unknown-linux-gnu --target-dir "$(obj)/gen"|g' "$node_crates_host_file"
+            sed -i 's|$(obj)/gen//release/libnode_crates.a|$(obj)/gen/i686-unknown-linux-gnu/release/libnode_crates.a|g' "$node_crates_host_file"
+          fi
+          node_crates_target_file="${NODE_DIR}/out/deps/crates/node_crates.target.mk"
+          if [[ -f "$node_crates_target_file" ]]; then
+            sed -i 's|mkdir -p $(obj)/gen//release; \
+              cargo rustc --release --frozen --target-dir "$(obj)/gen"|mkdir -p $(obj)/gen/arm-unknown-linux-gnueabihf/release; \
+              cargo rustc --release --frozen --target arm-unknown-linux-gnueabihf --target-dir "$(obj)/gen"|g' "$node_crates_target_file"
+            sed -i 's|$(obj)/gen//release/libnode_crates.a|$(obj)/gen/arm-unknown-linux-gnueabihf/release/libnode_crates.a|g' "$node_crates_target_file"
+          fi
+          mksnapshot_file="${NODE_DIR}/out/tools/v8_gypfiles/mksnapshot.host.mk"
+          if [[ -f "$mksnapshot_file" ]]; then
+            sed -i 's|$(obj)/gen//release/libnode_crates.a|$(obj)/gen/i686-unknown-linux-gnu/release/libnode_crates.a|g' "$mksnapshot_file"
+          fi
+
+          for f in \
+            "${NODE_DIR}/out/node.target.mk" \
+            "${NODE_DIR}/out/embedtest.target.mk" \
+            "${NODE_DIR}/out/cctest.target.mk" \
+            "${NODE_DIR}/out/node_mksnapshot.target.mk"
+          do
+            if [[ -f "$f" ]]; then
+              sed -i 's|$(obj)/gen//release/libnode_crates.a|$(obj)/gen/arm-unknown-linux-gnueabihf/release/libnode_crates.a|g' \
+                "$f"
+            fi
+          done
+
+      # Build only the host tools needed before ARM compilation can proceed.
+      # These are the slow part: V8 snapshot generator, Torque, bytecode generator.
+      # GYP generates a top-level Makefile that accepts target names directly.
+      - name: Build host tools only
+        working-directory: ${{ env.NODE_DIR }}
+        run: |
+          # List available make targets to find the right names
+          echo "=== Available top-level make targets ==="
+          grep "^\.PHONY" out/Makefile | head -5 || true
+          grep "^[a-z].*:$" out/Makefile | head -20 || true
+
+          # GYP top-level Makefile is at out/Makefile, targets are plain names
+          # For cross builds, host tools are built as part of these targets
+          make -j$(($(nproc)+1)) -C out \
+            mksnapshot \
+            torque \
+            bytecode_builtins_list_generator \
+            gen-regexp-special-case \
+            2>&1
+
+          # Verify the key binaries exist
+          echo "=== Checking host tool binaries ==="
+          ls -lh Release/mksnapshot Release/torque 2>/dev/null || \
+            ls -lh Release/ | head -20
+
+      # Save the entire source + build tree so Job 2 can continue
+      # We exclude heavy intermediate objects that job 2 will rebuild anyway
+      - name: Compress build tree for handoff
+        working-directory: ${{ env.NODE_DIR }}
+        run: |
+          tar --exclude='out/Release/obj/gen/arm*' \
+              --exclude='out/Release/obj.target' \
+              -czf /tmp/node-host-build.tar.gz \
+              . 2>&1 | tail -5
+          ls -lh /tmp/node-host-build.tar.gz
+
+      - name: Upload host build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-host-build
+          path: /tmp/node-host-build.tar.gz
+          retention-days: 1
+
+  # ============================================================
+  # JOB 2 - Download host tools, compile ARM target (part 1)
+  # Runs make for up to 5 hours then saves partial build
+  # ============================================================
+  build-target-1:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    needs: build-host-tools
+
+    steps:
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Install tttapa ARMv6 toolchain
+        run: |
+          wget https://github.com/tttapa/toolchains/releases/download/1.3.1/x-tools-armv6-rpi-linux-gnueabihf-gcc13.tar.xz
+          mkdir -p /opt/tttapa-toolchains
+          tar -xf x-tools-armv6-rpi-linux-gnueabihf-gcc13.tar.xz \
+            --strip-components=1 \
+            -C /opt/tttapa-toolchains \
+            x-tools/armv6-rpi-linux-gnueabihf
+          TOOLCHAIN_BIN=/opt/tttapa-toolchains/armv6-rpi-linux-gnueabihf/bin
+          "$TOOLCHAIN_BIN/armv6-rpi-linux-gnueabihf-g++" --version
+          echo "$TOOLCHAIN_BIN" >> $GITHUB_PATH
+          echo "TOOLCHAIN_BIN=$TOOLCHAIN_BIN" >> $GITHUB_ENV
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            curl \
+            ccache \
+            gcc-multilib \
+            g++-multilib \
+            python3 \
+            pkg-config \
+            libc6-dev \
+            make
+
+      - name: Download host build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: node-host-build
+          path: /tmp
+
+      - name: Restore build tree
+        run: |
+          mkdir -p "$NODE_DIR"
+          tar -xzf /tmp/node-host-build.tar.gz -C "$NODE_DIR"
+          echo "=== Restored build tree (target 1) from node-host-build.tar.gz ==="
+          ls "$NODE_DIR/out/Release/" | head -20
+
+          # Touch all source files to epoch so they appear OLDER than
+          # compiled objects — make will correctly skip already-built targets.
+          echo "=== Setting source timestamps older than objects ==="
+          find "$NODE_DIR" -not -path "*/out/*" -type f -exec touch -t 197001010000 {} +
+          echo "Done setting timestamps"
+
+      - name: Configure cross-compilation environment
+        run: |
+          rustup target add i686-unknown-linux-gnu
+          rustup target add arm-unknown-linux-gnueabihf
+
+          CROSS_GCC="$TOOLCHAIN_BIN/armv6-rpi-linux-gnueabihf-gcc -march=armv6zk"
+          CROSS_GXX="$TOOLCHAIN_BIN/armv6-rpi-linux-gnueabihf-g++ -march=armv6zk"
+
+          echo "CC=ccache ${CROSS_GCC}" >> $GITHUB_ENV
+          echo "CXX=ccache ${CROSS_GXX}" >> $GITHUB_ENV
+          echo "CC_host=ccache gcc -m32 -msse2" >> $GITHUB_ENV
+          echo "CXX_host=ccache g++ -m32 -msse2" >> $GITHUB_ENV
+          echo "CC_target=ccache ${CROSS_GCC}" >> $GITHUB_ENV
+          echo "CXX_target=ccache ${CROSS_GXX}" >> $GITHUB_ENV
+          echo "CARGO_TARGET_I686_UNKNOWN_LINUX_GNU_LINKER=gcc" >> $GITHUB_ENV
+          echo "CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_LINKER=${CROSS_GCC}" >> $GITHUB_ENV
+
+      # make is smart enough to see host tools already exist and skip them,
+      # then proceed to build ARM target objects and link the final binary
+      - name: Build ARM target part 1 (5h timeout)
+        working-directory: ${{ env.NODE_DIR }}
+        run: |
+          # Run make for up to 5 hours then stop gracefully.
+          # The partial build tree is saved so job 3 can continue.
+          timeout 18000 make -j$(($(nproc)+1)) || true
+          echo "=== Build stopped, saving partial build tree ==="
+          ls -lh out/Release/ | head -20
+
+      - name: Compress partial build tree for handoff
+        working-directory: ${{ env.NODE_DIR }}
+        run: |
+          # Include everything - obj.host, .deps all needed for make to
+          # correctly continue without recompiling anything from scratch.
+          tar -czf /tmp/node-target-partial.tar.gz . 2>&1 | tail -5
+          ls -lh /tmp/node-target-partial.tar.gz
+
+      - name: Upload partial build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-target-partial
+          path: /tmp/node-target-partial.tar.gz
+          retention-days: 1
+
+
+
+  # ============================================================
+  # JOB 3 - Continue ARM build (part 2) + package + release
+  # ============================================================
+  build-target-2:
+    runs-on: ubuntu-latest
+    needs: [build-host-tools, build-target-1]
+
+    steps:
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Install tttapa ARMv6 toolchain
+        run: |
+          wget https://github.com/tttapa/toolchains/releases/download/1.3.1/x-tools-armv6-rpi-linux-gnueabihf-gcc13.tar.xz
+          mkdir -p /opt/tttapa-toolchains
+          tar -xf x-tools-armv6-rpi-linux-gnueabihf-gcc13.tar.xz \
+            --strip-components=1 \
+            -C /opt/tttapa-toolchains \
+            x-tools/armv6-rpi-linux-gnueabihf
+          TOOLCHAIN_BIN=/opt/tttapa-toolchains/armv6-rpi-linux-gnueabihf/bin
+          "$TOOLCHAIN_BIN/armv6-rpi-linux-gnueabihf-g++" --version
+          echo "$TOOLCHAIN_BIN" >> $GITHUB_PATH
+          echo "TOOLCHAIN_BIN=$TOOLCHAIN_BIN" >> $GITHUB_ENV
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            curl \
+            ccache \
+            gcc-multilib \
+            g++-multilib \
+            python3 \
+            pkg-config \
+            libc6-dev \
+            make
+
+      - name: Download partial build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: node-target-partial
+          path: /tmp
+
+      - name: Restore partial build tree
+        run: |
+          mkdir -p "$NODE_DIR"
+          # --touch sets extracted file timestamps to extraction time,
+          # which is newer than source files — make will see objects as
+          # up-to-date and skip recompilation correctly.
+          tar -xzf /tmp/node-target-partial.tar.gz -C "$NODE_DIR"
+          echo "=== Restored build tree (target 2) from node-target-partial.tar.gz ==="
+          ls "${NODE_DIR}/out/Release/" | head -20
+
+          # Touch all source files to epoch so they appear OLDER than
+          # compiled objects — make will then correctly skip recompilation.
+          echo "=== Setting source timestamps older than objects ==="
+          find "$NODE_DIR" -not -path "*/out/*" -type f -exec touch -t 197001010000 {} +
+          echo "Done setting timestamps"
+
+      - name: Configure cross-compilation environment
+        run: |
+          rustup target add i686-unknown-linux-gnu
+          rustup target add arm-unknown-linux-gnueabihf
+
+          CROSS_GCC="$TOOLCHAIN_BIN/armv6-rpi-linux-gnueabihf-gcc -march=armv6zk"
+          CROSS_GXX="$TOOLCHAIN_BIN/armv6-rpi-linux-gnueabihf-g++ -march=armv6zk"
+
+          echo "CC=ccache ${CROSS_GCC}" >> $GITHUB_ENV
+          echo "CXX=ccache ${CROSS_GXX}" >> $GITHUB_ENV
+          echo "CC_host=ccache gcc -m32 -msse2" >> $GITHUB_ENV
+          echo "CXX_host=ccache g++ -m32 -msse2" >> $GITHUB_ENV
+          echo "CC_target=ccache ${CROSS_GCC}" >> $GITHUB_ENV
+          echo "CXX_target=ccache ${CROSS_GXX}" >> $GITHUB_ENV
+          echo "CARGO_TARGET_I686_UNKNOWN_LINUX_GNU_LINKER=gcc" >> $GITHUB_ENV
+          echo "CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_LINKER=${CROSS_GCC}" >> $GITHUB_ENV
+
+      - name: Build ARM target part 2 (finish)
+        working-directory: ${{ env.NODE_DIR }}
+        run: |
+          make -j$(($(nproc)+1))
+
+      - name: Package binary
+        env:
+          NODE_VERSION: ${{ needs.build-host-tools.outputs.node_version }}
+        working-directory: ${{ env.NODE_DIR }}
+        run: |
+          echo "Working in $(pwd) and have these files here: "
+          ls -la | head -20
+          
+          RELEASE_DIR=/tmp/node-release
+          RELEASE_NAME="node-v${NODE_VERSION}-linux-armv6zk"
+          MAJOR=$(echo "$NODE_VERSION" | cut -d. -f1)
+
+          make -C "$NODE_DIR" install DESTDIR="$RELEASE_DIR"
+
+          mv "$RELEASE_DIR/usr/local" "$RELEASE_DIR/v${NODE_VERSION}"
+
+          cp "$NODE_DIR/README.md"    "$RELEASE_DIR/v${NODE_VERSION}/"
+          cp "$NODE_DIR/LICENSE"      "$RELEASE_DIR/v${NODE_VERSION}/"
+          cp "$NODE_DIR/CHANGELOG.md" "$RELEASE_DIR/v${NODE_VERSION}/" 2>/dev/null || \
+            cp "$NODE_DIR/doc/changelogs/CHANGELOG_V${MAJOR}.md" \
+               "$RELEASE_DIR/v${NODE_VERSION}/CHANGELOG.md" 2>/dev/null || \
+            echo "CHANGELOG not found, skipping"
+
+          echo "=== Final archive layout ==="
+          ls -la "$RELEASE_DIR/v${NODE_VERSION}/"
+          echo "=== node_modules ==="
+          ls "$RELEASE_DIR/v${NODE_VERSION}/lib/node_modules/" 2>/dev/null || echo "lib/node_modules not found"
+          echo "=== bin ==="
+          ls -la "$RELEASE_DIR/v${NODE_VERSION}/bin/"
+
+          mkdir -p "$GITHUB_WORKSPACE/release-artifacts"
+          cd "$RELEASE_DIR"
+          echo "Now compressing \"v${NODE_VERSION}/\" into \"$GITHUB_WORKSPACE/release-artifacts/$RELEASE_NAME.tar.gz\""
+          tar -czf "$GITHUB_WORKSPACE/release-artifacts/$RELEASE_NAME.tar.gz" \
+            "v${NODE_VERSION}/"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.build-host-tools.outputs.node_version }}-armv6zk
+          name: "Node v${{ needs.build-host-tools.outputs.node_version }} - armv6zk"
+          files: release-artifacts/node-v${{ needs.build-host-tools.outputs.node_version }}-linux-armv6zk.tar.gz
+          token: ${{ secrets.PAT_TOKEN }}
+
