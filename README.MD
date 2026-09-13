@@ -20,6 +20,7 @@ Various patches are required depending on whether the major version is v24 or v2
     - `yield-processor.h` - fixes the `isb` instruction incorrect gating on __ARM_ARCH >= 6, which breaks assembly on plain ARMv6/ARMv6K/ARMv6ZK targets (it's only valid for ARMv6T2 or ARMv7, so for ARMv6ZK build we will change gate to ARMv7)
     - `json-stringifier.cc` - skip broken SIMD fast path on scalar-only targets, fallback to existing scalar function
     - `string-hasher.cc` - Skip broken SIMD path on scalar-only Highway targets (v25.x+ only)
+    - `flag-definitions.h` Disable Maglev by default (broken integer-division codegen on armv6zk without hardware divide)
 
 
 

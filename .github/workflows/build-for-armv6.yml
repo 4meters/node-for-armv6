@@ -209,6 +209,19 @@ jobs:
             echo "Patched string-hasher.cc IsOnly8BitSIMD"
           fi
 
+      - name: ARMv6 patches - Patch flag-definitions.h - disable maglev by default
+        working-directory: ${{ env.NODE_DIR }}
+        run: |
+          #Disable Maglev by default (broken integer-division codegen on armv6zk without hardware divide)
+          FILE="deps/v8/src/flags/flag-definitions.h"
+        
+          if ! grep -q 'DEFINE_BOOL(maglev, true,' "$FILE"; then
+            echo "WARN: 'DEFINE_BOOL(maglev, true,' not found in $FILE — not patching (may not apply to this V8 version)"
+          else
+            sed -i 's/DEFINE_BOOL(maglev, true,/DEFINE_BOOL(maglev, false,/' "$FILE"
+            echo "Patched $FILE — maglev now defaults to off"
+          fi
+
       - name: Configure Node.js
         working-directory: ${{ env.NODE_DIR }}
         run: |

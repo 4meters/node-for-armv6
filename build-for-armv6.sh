@@ -231,6 +231,22 @@ else
 	fi
 fi
 
+## Step 7e: Disable Maglev by default (broken integer-division codegen on armv6zk without hardware divide)
+echo -e "\n=== Step 7e: Patch flag-definitions.h - disable maglev by default ==="
+if [ -f "$NODE_SRC/.patched-maglev-default" ]; then
+    echo "Already patched (found .patched-maglev-default), skipping"
+else
+    FILE="$NODE_SRC/deps/v8/src/flags/flag-definitions.h"
+
+    if ! grep -q 'DEFINE_BOOL(maglev, true,' "$FILE"; then
+        echo "WARN: 'DEFINE_BOOL(maglev, true,' not found in $FILE — not patching (may not apply to this V8 version)"
+    else
+        sed -i 's/DEFINE_BOOL(maglev, true,/DEFINE_BOOL(maglev, false,/' "$FILE"
+        touch "$NODE_SRC/.patched-maglev-default"
+        echo "Patched $FILE — maglev now defaults to off"
+    fi
+fi
+
 # ── Step 8: Configure Node.js ─────────────────────────────────
 echo -e "\n=== Step 8: Configure Node.js ==="
 cd "$NODE_SRC"
