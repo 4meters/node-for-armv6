@@ -15,6 +15,12 @@
 #   - sudo access (for apt)
 #   - curl, wget, git
 
+# ── sudo check ────────────────────────────────────────────────
+if [ "$(id -u)" -ne 0 ]; then
+  echo "This script must be run as root. Please use sudo."
+  exit 1
+fi
+
 set -e
 
 # ── Config ────────────────────────────────────────────────────
@@ -110,10 +116,15 @@ if [ ! -d "$NODE_SRC/.git" ]; then
   git clone --branch "$LATEST_TAG" --depth 1 --single-branch \
               https://github.com/nodejs/node.git node
             echo "Cloned $(cd node && git rev-parse HEAD)"
-  NODE_VERSION="$LATEST_TAG#v"
+  NODE_VERSION="${LATEST_TAG#v}"
   echo "Node v$NODE_VERSION"
 else
-    echo "Node source already cloned at $NODE_SRC"
+  echo "Node source already cloned at $NODE_SRC"
+  EXISTING_TAG=$(git -C "$NODE_SRC" tag --points-at HEAD | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+  EXISTING_TAG="${EXISTING_TAG:-$(git -C "$NODE_SRC" describe --tags --abbrev=0 2>/dev/null)}"
+  [ -z "$EXISTING_TAG" ] && { echo "ERROR: could not determine NODE_VERSION from existing checkout"; exit 1; }
+  NODE_VERSION="${EXISTING_TAG#v}"
+  echo "Using existing checkout at tag $EXISTING_TAG -> NODE_VERSION=$NODE_VERSION"
 fi
 
 # ── Step 6a: Patch string-hasher (v25.x+ only) ───────────────────────────────
