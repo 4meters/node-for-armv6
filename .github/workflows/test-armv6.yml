@@ -31,7 +31,7 @@ jobs:
       - name: Download node binary from release
         run: |
           # Auto-detect latest release tag e.g. v26.3.0-armv6zk
-          RELEASE_TAG=$(gh release list --repo ${{ github.repository }}  --limit 1 --json tagName -q '.[0].tagName')
+          RELEASE_TAG=$(gh release list --repo ${{ github.repository }}  --limit 2 --json tagName -q '.[1].tagName')
           echo "Latest release: $RELEASE_TAG"
 
           # Extract node version: v26.3.0-armv6zk -> 26.3.0
